@@ -29,6 +29,7 @@ interfaces = {
   "TOYOTA PRIUS 2017": ToyotaInterface,
   "TOYOTA RAV4 2017": ToyotaInterface,
   "TOYOTA RAV4 2017 HYBRID": ToyotaInterface,
+  "TOYOTA RAV4 2018 SE": ToyotaInterface,
 
   "simulator": SimInterface,
   "simulator2": Sim2Interface,
