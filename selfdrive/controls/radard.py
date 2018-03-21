@@ -1,8 +1,7 @@
 #!/usr/bin/env python
-import os
 import zmq
 import numpy as np
-import numpy.matlib
+import importlib
 from collections import defaultdict
 from fastcluster import linkage_vector
 import selfdrive.messaging as messaging
@@ -15,7 +14,7 @@ from selfdrive.controls.lib.vehicle_model import VehicleModel
 from selfdrive.swaglog import cloudlog
 from cereal import car
 from common.params import Params
-from common.realtime import sec_since_boot, set_realtime_priority, Ratekeeper
+from common.realtime import set_realtime_priority, Ratekeeper
 from common.kalman.ekf import EKF, SimpleSensor
 
 DEBUG = False
@@ -49,14 +48,13 @@ def radard_thread(gctx=None):
   # wait for stats about the car to come in from controls
   cloudlog.info("radard is waiting for CarParams")
   CP = car.CarParams.from_bytes(Params().get("CarParams", block=True))
-  mocked= CP.radarName == "mock"
+  mocked = CP.carName == "mock"
   VM = VehicleModel(CP)
   cloudlog.info("radard got CarParams")
 
   # import the radar from the fingerprint
-  cloudlog.info("radard is importing %s", CP.radarName)
-  exec('from selfdrive.radar.'+CP.radarName+'.interface import RadarInterface')
-
+  cloudlog.info("radard is importing %s", CP.carName)
+  RadarInterface = importlib.import_module('selfdrive.car.%s.radar_interface' % CP.carName).RadarInterface
   context = zmq.Context()
 
   # *** subscribe to features and model from visiond
@@ -262,12 +260,13 @@ def radard_thread(gctx=None):
 
     for cnt, ids in enumerate(tracks.keys()):
       if DEBUG:
-        print "id: %4.0f x:  %4.1f  y: %4.1f  vr: %4.1f d: %4.1f  va: %4.1f  vl: %4.1f  vlk: %4.1f alk: %4.1f  s: %1.0f" % \
+        print "id: %4.0f x:  %4.1f  y: %4.1f  vr: %4.1f d: %4.1f  va: %4.1f  vl: %4.1f  vlk: %4.1f alk: %4.1f  s: %1.0f  v: %1.0f" % \
           (ids, tracks[ids].dRel, tracks[ids].yRel, tracks[ids].vRel,
            tracks[ids].dPath, tracks[ids].vLat,
            tracks[ids].vLead, tracks[ids].vLeadK,
            tracks[ids].aLeadK,
-           tracks[ids].stationary)
+           tracks[ids].stationary,
+           tracks[ids].measured)
       dat.liveTracks[cnt].trackId = ids
       dat.liveTracks[cnt].dRel = float(tracks[ids].dRel)
       dat.liveTracks[cnt].yRel = float(tracks[ids].yRel)

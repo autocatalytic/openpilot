@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import os
 import zmq
 
 import numpy as np
@@ -6,13 +7,12 @@ import math
 from collections import defaultdict
 
 from common.realtime import sec_since_boot
-from common.params import Params
 from common.numpy_fast import interp
 import selfdrive.messaging as messaging
 from selfdrive.swaglog import cloudlog
 from selfdrive.config import Conversions as CV
 from selfdrive.services import service_list
-from selfdrive.controls.lib.drive_helpers import create_event, EventTypes as ET
+from selfdrive.controls.lib.drive_helpers import create_event, MPC_COST_LONG, EventTypes as ET
 from selfdrive.controls.lib.pathplanner import PathPlanner
 from selfdrive.controls.lib.longitudinal_mpc import libmpc_py
 from selfdrive.controls.lib.speed_smoother import speed_smoother
@@ -25,6 +25,8 @@ AWARENESS_DECEL = -0.2     # car smoothly decel at .2m/s^2 when user is distract
 _DEBUG = False
 _LEAD_ACCEL_TAU = 1.5
 
+GPS_PLANNER_ADDR = "192.168.5.1"
+
 # lookup tables VS speed to determine min and max accels in cruise
 # make sure these accelerations are smaller than mpc limits
 _A_CRUISE_MIN_V  = [-1.0, -.8, -.67, -.5, -.30]
@@ -32,8 +34,8 @@ _A_CRUISE_MIN_BP = [   0., 5.,  10., 20.,  40.]
 
 # need fast accel at very low speed for stop and go
 # make sure these accelerations are smaller than mpc limits
-_A_CRUISE_MAX_V = [1., 1., .8, .5, .3]
-_A_CRUISE_MAX_V_FOLLOWING = [1.5, 1.5, 1.2, .7, .3]
+_A_CRUISE_MAX_V = [1.1, 1.1, .8, .5, .3]
+_A_CRUISE_MAX_V_FOLLOWING = [1.6, 1.6, 1.2, .7, .3]
 _A_CRUISE_MAX_BP = [0.,  5., 10., 20., 40.]
 
 # Lookup table for turns
@@ -110,7 +112,7 @@ class FCWChecker(object):
 
   def update(self, mpc_solution, cur_time, v_ego, a_ego, x_lead, v_lead, a_lead, y_lead, vlat_lead, fcw_lead, blinkers):
     mpc_solution_a = list(mpc_solution[0].a_ego)
-    self.last_min_a = min(mpc_solution_a[1:])
+    self.last_min_a = min(mpc_solution_a)
     self.v_lead_max = max(self.v_lead_max, v_lead)
 
     if (fcw_lead > 0.99):
@@ -125,7 +127,7 @@ class FCWChecker(object):
       self.counters['blinkers'] = self.counters['blinkers'] + 10.0 / (20 * 3.0) if not blinkers else 0
 
       a_thr = interp(v_lead, _FCW_A_ACT_BP, _FCW_A_ACT_V)
-      a_delta = min(mpc_solution_a[1:15]) - min(0.0, a_ego)
+      a_delta = min(mpc_solution_a[:15]) - min(0.0, a_ego)
 
       fcw_allowed = all(c >= 10 for c in self.counters.values())
       if (self.last_min_a < -3.0 or a_delta < a_thr) and fcw_allowed and self.last_fcw_time + 5.0 < cur_time:
@@ -162,6 +164,7 @@ class LongitudinalMpc(object):
     dat.liveLongitudinalMpc.xLead = list(self.mpc_solution[0].x_l)
     dat.liveLongitudinalMpc.vLead = list(self.mpc_solution[0].v_l)
     dat.liveLongitudinalMpc.aLead = list(self.mpc_solution[0].a_l)
+    dat.liveLongitudinalMpc.cost = self.mpc_solution[0].cost
     dat.liveLongitudinalMpc.aLeadTau = self.l
     dat.liveLongitudinalMpc.qpIterations = qp_iterations
     dat.liveLongitudinalMpc.mpcId = self.mpc_id
@@ -170,7 +173,8 @@ class LongitudinalMpc(object):
 
   def setup_mpc(self):
     ffi, self.libmpc = libmpc_py.get_libmpc(self.mpc_id)
-    self.libmpc.init()
+    self.libmpc.init(MPC_COST_LONG.TTC, MPC_COST_LONG.DISTANCE,
+                     MPC_COST_LONG.ACCELERATION, MPC_COST_LONG.JERK)
 
     self.mpc_solution = ffi.new("log_t *")
     self.cur_state = ffi.new("state_t *")
@@ -232,10 +236,10 @@ class LongitudinalMpc(object):
     self.v_mpc_future = self.mpc_solution[0].v_ego[10]
 
     # Reset if NaN or goes through lead car
-    dls = np.array(list(self.mpc_solution[0].x_l)[1:]) - np.array(list(self.mpc_solution[0].x_ego)[1:])
+    dls = np.array(list(self.mpc_solution[0].x_l)) - np.array(list(self.mpc_solution[0].x_ego))
     crashing = min(dls) < -50.0
     nans = np.any(np.isnan(list(self.mpc_solution[0].v_ego)))
-    backwards = min(list(self.mpc_solution[0].v_ego)[1:]) < -0.01
+    backwards = min(list(self.mpc_solution[0].v_ego)) < -0.01
 
     if ((backwards or crashing) and self.prev_lead_status) or nans:
       if t > self.last_cloudlog_t + 5.0:
@@ -243,7 +247,8 @@ class LongitudinalMpc(object):
         cloudlog.warning("Longitudinal mpc %d reset - backwards: %s crashing: %s nan: %s" % (
                           self.mpc_id, backwards, crashing, nans))
 
-      self.libmpc.init()
+      self.libmpc.init(MPC_COST_LONG.TTC, MPC_COST_LONG.DISTANCE,
+                       MPC_COST_LONG.ACCELERATION, MPC_COST_LONG.JERK)
       self.cur_state[0].v_ego = CS.vEgo
       self.cur_state[0].a_ego = 0.0
       self.v_mpc = CS.vEgo
@@ -258,6 +263,12 @@ class Planner(object):
     self.poller = zmq.Poller()
     self.live20 = messaging.sub_sock(context, service_list['live20'].port, conflate=True, poller=self.poller)
     self.model = messaging.sub_sock(context, service_list['model'].port, conflate=True, poller=self.poller)
+
+    if os.environ.get('GPS_PLANNER_ACTIVE', False):
+      self.gps_planner_plan = messaging.sub_sock(context, service_list['gpsPlannerPlan'].port, conflate=True, poller=self.poller, addr=GPS_PLANNER_ADDR)
+    else:
+      self.gps_planner_plan = None
+
     self.plan = messaging.pub_sock(context, service_list['plan'].port)
     self.live_longitudinal_mpc = messaging.pub_sock(context, service_list['liveLongitudinalMpc'].port)
 
@@ -292,6 +303,9 @@ class Planner(object):
     self.fcw_checker = FCWChecker()
     self.fcw_enabled = fcw_enabled
 
+    self.last_gps_planner_plan = None
+    self.gps_planner_active = False
+
   def choose_solution(self, v_cruise_setpoint, enabled):
     if enabled:
       solutions = {'cruise': self.v_cruise}
@@ -323,18 +337,24 @@ class Planner(object):
     self.v_acc_future = min([self.mpc1.v_mpc_future, self.mpc2.v_mpc_future, v_cruise_setpoint])
 
   # this runs whenever we get a packet that can change the plan
-  def update(self, CS, LoC, v_cruise_kph, user_distracted):
+  def update(self, CS, LaC, LoC, v_cruise_kph, user_distracted):
     cur_time = sec_since_boot()
     v_cruise_setpoint = v_cruise_kph * CV.KPH_TO_MS
 
     md = None
     l20 = None
+    gps_planner_plan = None
 
     for socket, event in self.poller.poll(0):
       if socket is self.model:
         md = messaging.recv_one(socket)
       elif socket is self.live20:
         l20 = messaging.recv_one(socket)
+      elif socket is self.gps_planner_plan:
+        gps_planner_plan = messaging.recv_one(socket)
+
+    if gps_planner_plan is not None:
+      self.last_gps_planner_plan = gps_planner_plan
 
     if md is not None:
       self.last_md_ts = md.logMonoTime
@@ -342,6 +362,17 @@ class Planner(object):
       self.model_dead = False
 
       self.PP.update(CS.vEgo, md)
+
+      if self.last_gps_planner_plan is not None:
+        plan = self.last_gps_planner_plan.gpsPlannerPlan
+        self.gps_planner_active = plan.valid
+        if plan.valid:
+          self.PP.d_poly = plan.poly
+          self.PP.p_poly = plan.poly
+          self.PP.c_poly = plan.poly
+          self.PP.l_prob = 0.0
+          self.PP.r_prob = 0.0
+          self.PP.c_prob = 1.0
 
     if l20 is not None:
       self.last_l20_ts = l20.logMonoTime
@@ -429,6 +460,8 @@ class Planner(object):
       events.append(create_event('radarCommIssue', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
     if 'fault' in self.radar_errors:
       events.append(create_event('radarFault', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
+    if LaC.mpc_solution[0].cost > 10000. or LaC.mpc_nans:   # TODO: find a better way to detect when MPC did not converge
+      events.append(create_event('plannerError', [ET.NO_ENTRY, ET.IMMEDIATE_DISABLE]))
 
     # Interpolation of trajectory
     dt = min(cur_time - self.acc_start_time, _DT_MPC + _DT) + _DT  # no greater than dt mpc + dt, to prevent too high extraps
@@ -453,6 +486,8 @@ class Planner(object):
     plan_send.plan.vTargetFuture = self.v_acc_future
     plan_send.plan.hasLead = self.mpc1.prev_lead_status
     plan_send.plan.longitudinalPlanSource = self.longitudinalPlanSource
+
+    plan_send.plan.gpsPlannerActive = self.gps_planner_active
 
     # Send out fcw
     fcw = self.fcw and (self.fcw_enabled or LoC.long_control_state != LongCtrlState.off)

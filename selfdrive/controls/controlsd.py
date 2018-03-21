@@ -73,7 +73,7 @@ def data_sample(CI, CC, thermal, calibration, health, poller, cal_status, overte
     overtemp_proc = any(t > 950 for t in
                         (td.thermal.cpu0, td.thermal.cpu1, td.thermal.cpu2,
                          td.thermal.cpu3, td.thermal.mem, td.thermal.gpu))
-    overtemp_bat = td.thermal.bat > 50000 # 50c
+    overtemp_bat = td.thermal.bat > 60000 # 60c
     overtemp = overtemp_proc or overtemp_bat
 
     # under 15% of space free no enable allowed
@@ -104,9 +104,9 @@ def data_sample(CI, CC, thermal, calibration, health, poller, cal_status, overte
   return CS, events, cal_status, overtemp, free_space
 
 
-def calc_plan(CS, events, PL, LoC, v_cruise_kph, awareness_status):
+def calc_plan(CS, events, PL, LaC, LoC, v_cruise_kph, awareness_status):
    # plan runs always, independently of the state
-   plan_packet = PL.update(CS, LoC, v_cruise_kph, awareness_status < -0.)
+   plan_packet = PL.update(CS, LaC, LoC, v_cruise_kph, awareness_status < -0.)
    plan = plan_packet.plan
    plan_ts = plan_packet.logMonoTime
 
@@ -210,8 +210,9 @@ def state_transition(CS, CP, state, events, soft_disable_timer, v_cruise_kph, AM
   return state, soft_disable_timer, v_cruise_kph, v_cruise_kph_last
 
 
-def state_control(plan, CS, CP, state, events, v_cruise_kph, v_cruise_kph_last, AM, rk, 
-                  awareness_status, PL, LaC, LoC, VM, angle_offset, rear_view_allowed, rear_view_toggle):
+def state_control(plan, CS, CP, state, events, v_cruise_kph, v_cruise_kph_last, AM, rk,
+                  awareness_status, PL, LaC, LoC, VM, angle_offset, rear_view_allowed, 
+                  rear_view_toggle, passive):
   # Given the state, this function returns the actuators
 
   # reset actuators to zero
@@ -228,7 +229,7 @@ def state_control(plan, CS, CP, state, events, v_cruise_kph, v_cruise_kph_last, 
       else:
         rear_view_toggle = False
 
-    if b.type == "altButton1" and b.pressed:
+    if (b.type == "altButton1" and b.pressed) and not passive:
       rear_view_toggle = not rear_view_toggle
 
 
@@ -273,8 +274,8 @@ def state_control(plan, CS, CP, state, events, v_cruise_kph, v_cruise_kph_last, 
                                               CP, PL.lead_1)
 
   # *** steering PID loop ***
-  actuators.steer = LaC.update(active, CS.vEgo, CS.steeringAngle,
-                               CS.steeringPressed, plan.dPoly, angle_offset, VM, PL)
+  actuators.steer, actuators.steerAngle = LaC.update(active, CS.vEgo, CS.steeringAngle,
+                                                     CS.steeringPressed, plan.dPoly, angle_offset, VM, PL)
 
   # send a "steering required alert" if saturation count has reached the limit
   if LaC.sat_flag and CP.steerLimitAlert:
@@ -387,6 +388,9 @@ def data_send(plan, plan_ts, CS, CI, CP, VM, state, events, actuators, v_cruise_
   # log learned angle offset
   dat.live100.angleOffset = float(angle_offset)
 
+  # Save GPS planner status
+  dat.live100.gpsPlannerActive = plan.gpsPlannerActive
+
   # lag
   dat.live100.cumLagMs = -rk.remaining*1000.
 
@@ -397,6 +401,7 @@ def data_send(plan, plan_ts, CS, CI, CP, VM, state, events, actuators, v_cruise_
   cs_send.init('carState')
   # TODO: override CS.events with all the cumulated events
   cs_send.carState = copy(CS)
+  cs_send.carState.events = events
   carstate.send(cs_send.to_bytes())
 
   # broadcast carControl
@@ -404,7 +409,6 @@ def data_send(plan, plan_ts, CS, CI, CP, VM, state, events, actuators, v_cruise_
   cc_send.init('carControl')
   cc_send.carControl = copy(CC)
   carcontrol.send(cc_send.to_bytes())
-  #print [i.name for i in events]
 
   # publish mpc state at 20Hz
   if hasattr(LaC, 'mpc_updated') and LaC.mpc_updated:
@@ -414,6 +418,7 @@ def data_send(plan, plan_ts, CS, CI, CP, VM, state, events, actuators, v_cruise_
     dat.liveMpc.y = list(LaC.mpc_solution[0].y)
     dat.liveMpc.psi = list(LaC.mpc_solution[0].psi)
     dat.liveMpc.delta = list(LaC.mpc_solution[0].delta)
+    dat.liveMpc.cost = LaC.mpc_solution[0].cost
     livempc.send(dat.to_bytes())
 
   return CC
@@ -453,6 +458,11 @@ def controlsd_thread(gctx, rate=100):
 
   if CI is None:
     raise Exception("unsupported car")
+
+  # if stock camera is connected, then force passive behavior
+  if not CP.enableCamera:
+    passive = True
+    sendcan = None
 
   if passive:
     CP.safetyModel = car.CarParams.SafetyModels.noOutput
@@ -508,19 +518,19 @@ def controlsd_thread(gctx, rate=100):
     prof.checkpoint("Sample")
 
     # define plan
-    plan, plan_ts = calc_plan(CS, events, PL, LoC, v_cruise_kph, awareness_status)
+    plan, plan_ts = calc_plan(CS, events, PL, LaC, LoC, v_cruise_kph, awareness_status)
     prof.checkpoint("Plan")
 
     if not passive:
       # update control state
-      state, soft_disable_timer, v_cruise_kph, v_cruise_kph_last = state_transition(CS, CP, state, events, soft_disable_timer, 
+      state, soft_disable_timer, v_cruise_kph, v_cruise_kph_last = state_transition(CS, CP, state, events, soft_disable_timer,
                                                                                     v_cruise_kph, AM)
       prof.checkpoint("State transition")
 
     # compute actuators
     actuators, v_cruise_kph, awareness_status, angle_offset, rear_view_toggle = state_control(plan, CS, CP, state, events, v_cruise_kph,
                                                                             v_cruise_kph_last, AM, rk, awareness_status, PL, LaC, LoC, VM,
-                                                                            angle_offset, rear_view_allowed, rear_view_toggle)
+                                                                            angle_offset, rear_view_allowed, rear_view_toggle, passive)
     prof.checkpoint("State Control")
 
     # publish data
